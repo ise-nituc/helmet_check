@@ -193,6 +193,8 @@ class SafetyDetector:
                 if not ret:
                     print("Failed to read frame from camera")
                     break
+                # Mirror the webcam before detection so labels stay readable.
+                frame = cv2.flip(frame, 1)
                 annotated, people, helmeted_people = self.process_frame(frame)
                 cv2.putText(annotated, f"People: {people} | Helmet on: {helmeted_people}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
                 cv2.imshow(self.window_name, annotated)
