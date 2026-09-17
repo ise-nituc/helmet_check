@@ -1,10 +1,11 @@
 from ultralytics import YOLO
 from numpy import ndarray
+from pathlib import Path
 import cv2
 
 
-PERSON_CLASS_ID = 0
-HELMET_CLASS_ID = 0
+# Source: https://huggingface.co/Hansung-Cho/yolov8-ppe-detection
+DEFAULT_MODEL_PATH = Path(__file__).resolve().with_name("ppe_yolov8n.pt")
 SAFE_COLOR = (40, 220, 80)
 DANGER_COLOR = (40, 40, 230)
 HELMET_COLOR = (40, 220, 220)
@@ -30,12 +31,15 @@ class SafetyDetector:
 
     def __init__(
         self,
-        person_model_path: str = "yolov8n.onnx",
-        helmet_model_path: str = "helmet.pt",
+        model_path: str | Path = DEFAULT_MODEL_PATH,
     ) -> None:
 
-        self.person_model = YOLO(person_model_path)
-        self.helmet_model = YOLO(helmet_model_path)
+        self.model = YOLO(model_path)
+        class_ids = {name.lower(): class_id for class_id, name in self.model.names.items()}
+        if not {"person", "hardhat"}.issubset(class_ids):
+            raise ValueError("The unified model must contain Person and Hardhat classes.")
+        self.person_class_id = class_ids["person"]
+        self.helmet_class_id = class_ids["hardhat"]
         self.cap = None
         self.window_name = "Safety Detector"
 
@@ -43,9 +47,10 @@ class SafetyDetector:
         self.target_fps = 30
         self.model_input_size = 416
         self.person_confidence_threshold = 0.25
-        self.helmet_confidence_threshold = 0.75
-        self.min_helmet_inside_person = 0.15
-        self.helmet_person_height_ratio = 0.45
+        self.helmet_confidence_threshold = 0.25
+        self.min_helmet_head_iou = 0.15
+        # Estimate the head region as the top 25% of the person box.
+        self.head_person_height_ratio = 0.25
         self.window_size = (800, 600)
         self.escape_key = 27
 
@@ -67,7 +72,9 @@ class SafetyDetector:
 
     def detections_from_result(
         self,
-        result
+        result,
+        class_id: int,
+        confidence_threshold: float,
     ) -> list[Detection]:
 
         """Convert Ultralytics result boxes to lightweight detections."""
@@ -81,6 +88,7 @@ class SafetyDetector:
                 confidence=float(box.conf[0]),
             )
             for box in result.boxes
+            if int(box.cls[0]) == class_id and float(box.conf[0]) >= confidence_threshold
         ]
 
     def intersection_area(
@@ -107,23 +115,26 @@ class SafetyDetector:
         person: Detection
     ) -> bool:
 
-        """Return whether a helmet is in the upper portion of a person box."""
+        """Match a helmet to an estimated head region using intersection over union.
+
+        The head region is the top portion of the person box, not a detected
+        head. IoU measures box overlap; it does not verify proper helmet fit.
+        """
         helmet_area = self.box_area(helmet.box)
-        if helmet_area == 0:
+        if helmet_area == 0 or self.box_area(person.box) == 0:
             return False
 
-        hx1, hy1, hx2, hy2 = helmet.box
         px1, py1, px2, py2 = person.box
-        helmet_center_x = (hx1 + hx2) / 2
-        helmet_center_y = (hy1 + hy2) / 2
-        head_limit = py1 + (py2 - py1) * self.helmet_person_height_ratio
+        head_limit = py1 + int((py2 - py1) * self.head_person_height_ratio)
+        head_box = (px1, py1, px2, head_limit)
+        head_area = self.box_area(head_box)
+        if head_area == 0:
+            return False
 
-        return (
-            self.intersection_area(helmet.box, person.box) / helmet_area
-            >= self.min_helmet_inside_person
-            and px1 <= helmet_center_x <= px2
-            and py1 <= helmet_center_y <= head_limit
-        )
+        # IoU = intersection / union, comparing the helmet with the head region.
+        intersection = self.intersection_area(helmet.box, head_box)
+        union = helmet_area + head_area - intersection
+        return intersection / union >= self.min_helmet_head_iou
 
     def draw_label(
         self,
@@ -144,25 +155,22 @@ class SafetyDetector:
         frame: ndarray
     ) -> tuple[ndarray, int, int]:
     
-        """Annotate a frame and return people, helmeted people, and helmet status."""
+        """Run one inference and return the annotated frame and person counts."""
     
         annotated = cv2.resize(frame, (self.model_input_size, self.model_input_size))
-        person_result = self.person_model.predict(
+        result = self.model.predict(
             annotated,
             imgsz=self.model_input_size,
-            conf=self.person_confidence_threshold,
-            classes=[PERSON_CLASS_ID],
+            conf=min(self.person_confidence_threshold, self.helmet_confidence_threshold),
+            classes=[self.person_class_id, self.helmet_class_id],
             verbose=False,
         )[0]
-        helmet_result = self.helmet_model.predict(
-            annotated,
-            imgsz=self.model_input_size,
-            conf=self.helmet_confidence_threshold,
-            classes=[HELMET_CLASS_ID],
-            verbose=False,
-        )[0]
-        people = self.detections_from_result(person_result)
-        helmets = self.detections_from_result(helmet_result)
+        people = self.detections_from_result(
+            result, self.person_class_id, self.person_confidence_threshold
+        )
+        helmets = self.detections_from_result(
+            result, self.helmet_class_id, self.helmet_confidence_threshold
+        )
 
         helmeted_people = 0
         for person in people:
